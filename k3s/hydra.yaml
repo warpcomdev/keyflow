@@ -1,0 +1,125 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hydra
+  labels:
+    app: hydra
+data:
+  SECRETS_SYSTEM: fbzhOkIUTgZAKKixp2zlub5mG8e5pptf
+  DSN: postgres://hydra:admin123@postgres:5432/hydra?sslmode=disable
+  URLS_SELF_ISSUER: http://hydra/
+  URLS_CONSENT: http://flow/consent
+  URLS_LOGIN: http://flow/login
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hydra
+  labels:
+    app: hydra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hydra
+  template:
+    metadata:
+      labels:
+        app: hydra
+    spec:
+      initContainers:
+      - name: init
+        image: oryd/hydra:v1.10.2
+        envFrom:
+        - configMapRef:
+            name: hydra
+        args:
+        - migrate
+        - sql
+        - -e
+        - -y
+      containers:
+      - name: hydra
+        image: oryd/hydra:v1.10.2
+        ports:
+        - containerPort: 4444
+        - containerPort: 4445
+        envFrom:
+        - configMapRef:
+            name: hydra
+        args:
+        - serve
+        - all
+        - --dangerous-force-http
+      - name: sidecar
+        image: ubuntu:20.04
+        command:
+        - /bin/tail
+        args:
+        - -f
+        - "/dev/null"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hydra-api
+  labels:
+    app: hydra
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 4445
+  selector:
+    app: hydra
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hydra
+  labels:
+    app: hydra
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 4444
+  selector:
+    app: hydra
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hydra-api
+spec:
+  rules:
+  - host: hydra-api
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: hydra-api
+            port:
+              number: 80
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hydra
+spec:
+  rules:
+  - host: hydra
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: hydra
+            port:
+              number: 80
+
