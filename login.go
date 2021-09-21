@@ -70,7 +70,7 @@ type ConsentRequest struct {
 // ErrorMessage returned by the API on error
 type ErrorMessage struct {
 	Redirect string `json:"redirect"`
-	Fatal    bool   `json:"fatal"` // True if error was fatal and cannot be retried
+	Final    bool   `json:"final"` // True if error was fatal and cannot be retried
 	JsonError
 }
 
@@ -79,11 +79,12 @@ type SuccessMessage struct {
 	// On POST, this is always the redirect URL.
 	// On GET, this is always the login/consent page.
 	Redirect string `json:"redirect"`
-	Final    bool   `json:"final"` // If true, no more processing after this message.
+	Final    bool   `json:"final"` // True if auth process completed
 	// On CONSENT, this is always the challenge user info.
 	// On AUTH, this is the logged user info, if there is a session. Otherwise, it is empty.
+	// This can be used to check whether the user is logged in or not.
 	LoginInfo
-	// Client is always empty for POST.
+	// Client is only returned for GET calls, both auth and consent.
 	Client ClientInfo `json:"client,omitempty"`
 }
 
@@ -102,7 +103,9 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// collect challenge information from hydra.
-	// -----------------------------------------------------------
+	// We can be performing a login in the consent flow,
+	// if the session is closed.
+	// -------------------------------------------------
 	var challengeData Challenge
 	if isAuthFlow {
 		challengeData, err = api.HydraClient.AuthChallenge(r.Context(), api.Client, challenge)
@@ -119,7 +122,7 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 		api.send(w, r, marshal, api.skipAuth(r.Context(), now, challenge, challengeData))
 		return
 	}
-	// If not skipped, GET requests get redirected to either
+	// If not skipped, GET requests are redirected to either
 	// login form or accept form, depending on whether we have
 	// a valid session.
 	// ---------------------------------------------
@@ -129,7 +132,7 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 		redirect = api.AcceptPath
 	} else {
 		// If token is invalid, go ahead but make sure to remove the session
-		w = cookieRemoverWriter{cookieName: CookieJwt, ResponseWriter: w}
+		removeCookie(w, CookieJwt)
 	}
 	api.send(w, r, marshal, SuccessMessage{
 		LoginInfo: info,
@@ -164,7 +167,7 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 	if loginRequest.Accept && info.Subject == "" {
 		// Tried to accept but session expired, reject
 		// with Redirect => LoginPath.
-		w = cookieRemoverWriter{cookieName: CookieJwt, ResponseWriter: w}
+		removeCookie(w, CookieJwt)
 		api.send(w, r, marshal, newErrorMessage(
 			http.StatusUnauthorized,
 			ErrorAcceptSessionExpired,
@@ -239,7 +242,7 @@ func (api *Api) GetConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if challengeData.Skip {
-		// either succeed or fail without showing login screen
+		// either succeed or fail without showing consent screen
 		api.send(w, r, marshal, api.skipConsent(r.Context(), now, challenge, challengeData))
 		return
 	}
@@ -267,13 +270,14 @@ func (api *Api) PostConsent(w http.ResponseWriter, r *http.Request) {
 	marshal := api.encoder(w, r)
 	now := time.Now()
 	// Make sure we remove the login challenge, in case we
-	// have to login again.
-	w = cookieRemoverWriter{cookieName: CookieLoginChallenge, ResponseWriter: w}
+	// have to divert the user to the login form.
+	removeCookie(w, CookieLoginChallenge)
 	// To consent, we need a valid session.
 	// If there is no JWT, login first.
 	// ------------------------------------
 	info, _, err := api.ReadJWT(r, now)
 	if info.Subject == "" {
+		removeCookie(w, CookieJwt)
 		api.send(w, r, marshal, newErrorMessage(
 			http.StatusUnauthorized,
 			ErrorAcceptSessionExpired,
@@ -324,14 +328,7 @@ func (api *Api) PostConsent(w http.ResponseWriter, r *http.Request) {
 // Logout handler for GET routes
 func (api *Api) Logout(w http.ResponseWriter, r *http.Request) {
 	defer exhaust(r.Body)
-	http.SetCookie(w, &http.Cookie{
-		Name:     CookieJwt,
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		Expires:  time.Now(),
-		Value:    "",
-	})
+	removeCookie(w, CookieJwt)
 	http.Redirect(w, r, api.LoginPath, http.StatusSeeOther)
 }
 
@@ -366,6 +363,7 @@ func (api *Api) getChallenge(w http.ResponseWriter, r *http.Request, now time.Ti
 	if challenge == "" {
 		return "", errors.New("Missing challenge")
 	}
+	// Refresh cookie, even if it already existed
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		HttpOnly: true,
@@ -591,7 +589,7 @@ func (api *Api) rejectAuth(ctx context.Context, loginChallenge string, loginReje
 	}
 	return ErrorMessage{
 		JsonError: loginReject.Json(http.StatusUnauthorized),
-		Fatal:     true,
+		Final:     true,
 		Redirect:  redirect,
 	}
 }
@@ -604,7 +602,7 @@ func (api *Api) rejectConsent(ctx context.Context, consentChallenge string, chal
 	}
 	return ErrorMessage{
 		JsonError: challengeReject.Json(http.StatusUnauthorized),
-		Fatal:     true,
+		Final:     true,
 		Redirect:  redirect,
 	}
 }
@@ -673,7 +671,7 @@ func (e ErrorMessage) statusCode() int {
 
 // isFinal implements message
 func (e ErrorMessage) isFinal() bool {
-	return e.Fatal
+	return e.Final
 }
 
 type cookieRemoverWriter struct {
