@@ -10,10 +10,9 @@ import (
 
 // Credentials required to log in
 type Credentials struct {
-	Username string   `json:"username"`
-	Password string   `json:"password"`
-	Domain   string   `json:"domain"`
-	Scopes   []string `json:"scopes,omitempty"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Domain   string `json:"domain"`
 }
 
 // LoginInfo is the information returned on successful login
@@ -43,9 +42,15 @@ func (o *OrionClient) Decode(subject string, scopes []string) (zero LoginInfo, e
 	return loginInfo, nil
 }
 
-// Skip auth, try to validate decoded info
-func (o *OrionClient) Skip(ctx context.Context, client *http.Client, info LoginInfo) error {
-	// TODO: Validate session
+// SkipAuth auth, try to validate decoded info
+func (o *OrionClient) SkipAuth(ctx context.Context, client *http.Client, info LoginInfo) error {
+	// TODO: Validate session?
+	return nil
+}
+
+// SkipConsent tries to validate consent info
+func (o *OrionClient) SkipConsent(ctx context.Context, client *http.Client, info LoginInfo) error {
+	// TODO: Validate session?
 	return nil
 }
 
@@ -59,12 +64,11 @@ func (o *OrionClient) Login(ctx context.Context, client *http.Client, creds Cred
 		Subject:  fmt.Sprintf("%s@%s", creds.Username, creds.Domain),
 		Username: creds.Username,
 		Domain:   creds.Domain,
-		Scopes:   creds.Scopes,
 	}
 	return loginInfo, nil
 }
 
-// Consent with the provided scopes
+// Consent for the provided account
 func (o *OrionClient) Consent(ctx context.Context, client *http.Client, info LoginInfo) error {
 	// TODO: Grant Consent for session
 	return nil

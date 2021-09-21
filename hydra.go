@@ -11,6 +11,11 @@ import (
 	"net/url"
 )
 
+const (
+	LOGIN_CHALLENGE   = "login_challenge"
+	CONSENT_CHALLENGE = "consent_challenge"
+)
+
 // HydraClient encapsulates the Hydra protocols
 type HydraClient struct {
 	URL string
@@ -48,7 +53,7 @@ type LoginAccept struct {
 
 // ConsentAccept is the information sent for accepting a challenge
 type ConsentAccept struct {
-	GrantScope  []string `json:"grant_scope"`
+	Scopes      []string `json:"grant_scope"`
 	Remember    bool     `json:"remember,omitempty"`
 	RememberFor int      `json:"remember_for,omitempty"`
 }
@@ -99,15 +104,15 @@ func (err JsonError) Error() string {
 }
 
 // Req builds a request with the given challenge, method and body
-func (hc *HydraClient) request(ctx context.Context, client *http.Client, path string, method string, challengeName, loginChallenge string, body interface{}, result interface{}) error {
+func (hc *HydraClient) request(ctx context.Context, client *http.Client, path string, method string, challengeName, challenge string, body interface{}, result interface{}) error {
 	// Build query with params
 	reqURL, err := url.Parse(hc.URL + path)
 	if err != nil {
 		return err
 	}
 	query := reqURL.Query()
-	if loginChallenge != "" {
-		query.Add(challengeName, loginChallenge)
+	if challenge != "" {
+		query.Add(challengeName, challenge)
 	}
 	// If body is not nil, create a ReadCloser
 	var ioBody io.ReadCloser
@@ -148,50 +153,50 @@ func (hc *HydraClient) request(ctx context.Context, client *http.Client, path st
 	return nil
 }
 
-// Reject a login Challenge, return redirect URL
-func (hc *HydraClient) Reject(ctx context.Context, client *http.Client, loginChallenge string, reject ChallengeReject) (string, error) {
+// AuthReject a login Challenge, return redirect URL
+func (hc *HydraClient) AuthReject(ctx context.Context, client *http.Client, challenge string, reject ChallengeReject) (string, error) {
 	var loginResp feedbackResponse
-	if err := hc.request(ctx, client, "/oauth2/auth/requests/login/reject", http.MethodPut, "login_challenge", loginChallenge, reject, &loginResp); err != nil {
+	if err := hc.request(ctx, client, "/oauth2/auth/requests/login/reject", http.MethodPut, LOGIN_CHALLENGE, challenge, reject, &loginResp); err != nil {
 		return "", err
 	}
 	return loginResp.RedirectTo, nil
 }
 
-// Accept a login Challenge, return redirect URL
-func (hc *HydraClient) Accept(ctx context.Context, client *http.Client, loginChallenge string, accept LoginAccept) (string, error) {
+// AuthAccept a login Challenge, return redirect URL
+func (hc *HydraClient) AuthAccept(ctx context.Context, client *http.Client, challenge string, accept LoginAccept) (string, error) {
 	var feedback feedbackResponse
-	if err := hc.request(ctx, client, "/oauth2/auth/requests/login/accept", http.MethodPut, "login_challenge", loginChallenge, accept, &feedback); err != nil {
+	if err := hc.request(ctx, client, "/oauth2/auth/requests/login/accept", http.MethodPut, LOGIN_CHALLENGE, challenge, accept, &feedback); err != nil {
 		return "", err
 	}
 	return feedback.RedirectTo, nil
 }
 
-// Challenge retrieves info from loginChallenge
-func (hc *HydraClient) Challenge(ctx context.Context, client *http.Client, loginChallenge string) (zero Challenge, err error) {
-	err = hc.request(ctx, client, "/oauth2/auth/requests/login", http.MethodGet, "login_challenge", loginChallenge, nil, &zero)
+// AuthChallenge retrieves info from loginChallenge
+func (hc *HydraClient) AuthChallenge(ctx context.Context, client *http.Client, challenge string) (zero Challenge, err error) {
+	err = hc.request(ctx, client, "/oauth2/auth/requests/login", http.MethodGet, LOGIN_CHALLENGE, challenge, nil, &zero)
 	return
 }
 
 // Reject a login Challenge, return redirect URL
-func (hc *HydraClient) ConsentReject(ctx context.Context, client *http.Client, consentChallenge string, reject ChallengeReject) (string, error) {
+func (hc *HydraClient) ConsentReject(ctx context.Context, client *http.Client, challenge string, reject ChallengeReject) (string, error) {
 	var feedback feedbackResponse
-	if err := hc.request(ctx, client, "/oauth2/auth/requests/consent/reject", http.MethodPut, "consent_challenge", consentChallenge, reject, &feedback); err != nil {
+	if err := hc.request(ctx, client, "/oauth2/auth/requests/consent/reject", http.MethodPut, CONSENT_CHALLENGE, challenge, reject, &feedback); err != nil {
 		return "", err
 	}
 	return feedback.RedirectTo, nil
 }
 
 // Accept a login Challenge, return redirect URL
-func (hc *HydraClient) ConsentAccept(ctx context.Context, client *http.Client, consentChallenge string, accept ConsentAccept) (string, error) {
+func (hc *HydraClient) ConsentAccept(ctx context.Context, client *http.Client, challenge string, accept ConsentAccept) (string, error) {
 	var feedback feedbackResponse
-	if err := hc.request(ctx, client, "/oauth2/auth/requests/consent/accept", http.MethodPut, "consent_challenge", consentChallenge, accept, &feedback); err != nil {
+	if err := hc.request(ctx, client, "/oauth2/auth/requests/consent/accept", http.MethodPut, CONSENT_CHALLENGE, challenge, accept, &feedback); err != nil {
 		return "", err
 	}
 	return feedback.RedirectTo, nil
 }
 
 // ConsentChallenge retrieves info from consentChallenge
-func (hc *HydraClient) ConsentChallenge(ctx context.Context, client *http.Client, consentChallenge string) (zero Challenge, err error) {
-	err = hc.request(ctx, client, "/oauth2/auth/requests/consent", http.MethodGet, "consent_challenge", consentChallenge, nil, &zero)
+func (hc *HydraClient) ConsentChallenge(ctx context.Context, client *http.Client, challenge string) (zero Challenge, err error) {
+	err = hc.request(ctx, client, "/oauth2/auth/requests/consent", http.MethodGet, CONSENT_CHALLENGE, challenge, nil, &zero)
 	return
 }
