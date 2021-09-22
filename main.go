@@ -5,40 +5,41 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/gorilla/csrf"
+	"github.com/gorilla/mux"
 )
 
 func main() {
 
-	api := Api{
-		LoginPath:      "/login",
-		ErrorPath:      "/error",
-		CookieLifetime: 1 * time.Hour,
-		Client:         http.DefaultClient,
-		HydraClient: &HydraClient{
+	api := NewApi(
+		"/login", "/accept", "/consent", "/error",
+		nil,
+		1*time.Hour,
+		&HydraClient{
 			URL: "http://localhost:8080",
 		},
-		JWT: &JWT{
+		&OrionClient{},
+		&JWT{
 			Issuer:        "testIssuer",
 			SigningMethod: jwt.SigningMethodHS512,
 			Keyfunc: func(*jwt.Token) (interface{}, error) {
 				return []byte("12345678901234567890123456789012"), nil
 			},
-		},
-		Orion: &OrionClient{},
-	}
-	http.HandleFunc("/api/auth", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			api.GetLogin(w, r)
-		} else {
-			api.PostLogin(w, r)
-		}
-	}))
-	http.HandleFunc("/api/consent", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			api.GetConsent(w, r)
-		} else {
-			api.PostConsent(w, r)
-		}
-	}))
-	http.ListenAndServe(":8080", nil)
+		})
+
+	csrfKey := []byte{}
+	router := mux.NewRouter()
+	apiRoute := router.Path("/api").Subrouter()
+	apiRoute.Use(csrf.Protect(
+		csrfKey,
+		csrf.SameSite(csrf.SameSiteStrictMode),
+		csrf.ErrorHandler(http.HandlerFunc(api.csrfErrorHandler)),
+	))
+
+	apiRoute.HandleFunc("/auth", api.PostLogin).Methods("POST")
+	apiRoute.HandleFunc("/auth", api.GetLogin).Methods("GET")
+	apiRoute.HandleFunc("/consent", api.PostConsent).Methods("POST")
+	apiRoute.HandleFunc("/consent", api.GetConsent).Methods("GET")
+
+	http.ListenAndServe(":8080", router)
 }

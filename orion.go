@@ -10,9 +10,9 @@ import (
 
 // Credentials required to log in
 type Credentials struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Domain   string `json:"domain"`
+	Username string `json:"username" schema:"username"`
+	Password string `json:"password" schema:"password"`
+	Domain   string `json:"domain" schema:"domain"`
 }
 
 // LoginInfo is the information returned on successful login

@@ -1,13 +1,17 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
+	"html/template"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/gorilla/csrf"
+	"github.com/gorilla/schema"
 
 	"github.com/golang-jwt/jwt/v4"
 )
@@ -26,66 +30,94 @@ const (
 	ErrorSigningFailed          = "signing_failed"
 	ErrorAuthFailed             = "auth_failed"
 	ErrorSkipFailed             = "skip_failed"
+	ErrorCSRFFailure            = "csrf_failure"
 
 	CookieLoginChallenge   = "orionauth2-login-challenge"
 	CookieConsentChallenge = "orionauth2-consent-challenge"
-	CookieJwt              = "orionauth2-login-jwt"
-
-	CurrentFlowAuth    = "auth"
-	CurrentFlowConsent = "consent"
+	CookieJwt              = "orionauth2-jwt"
 )
 
 // Api controls the login and grant flows
 type Api struct {
-	LoginPath      string        // Path to login page
-	AcceptPath     string        // Path to accept page (when already logged in)
-	ConsentPath    string        // Path to consent page (when already logged in)
-	ErrorPath      string        // Path to error page
-	CookieLifetime time.Duration // Session lifetime
-	Client         *http.Client  // http Client
-	HydraClient    *HydraClient  // Hydra API client
-	Orion          *OrionClient  // Orion client
-	JWT            *JWT          // JWT settings
+	LoginPath      string             // Path to login page
+	AcceptPath     string             // Path to accept page (when already logged in)
+	ConsentPath    string             // Path to consent page (when already logged in)
+	ErrorPath      string             // Path to error page
+	Templates      *template.Template // If a template name matches a path, the template gets rendered instead of redirecting the customer
+	CookieLifetime time.Duration      // Session lifetime
+	Client         *http.Client       // http Client
+	Hydra          *HydraClient       // Hydra API client
+	Orion          *OrionClient       // Orion client
+	JWT            *JWT               // JWT settings
+	Decoder        *schema.Decoder    // schema decoder
 }
 
-// LoginRequest contains the information POSTed as json to the server
+func NewApi(loginPath, acceptPath, consentPath, errorPath string, templates *template.Template, cookieLifetime time.Duration, hydraClient *HydraClient, orionClient *OrionClient, jwtClient *JWT) *Api {
+	return &Api{
+		LoginPath:      loginPath,
+		AcceptPath:     acceptPath,
+		ConsentPath:    consentPath,
+		ErrorPath:      errorPath,
+		Templates:      templates,
+		CookieLifetime: cookieLifetime,
+		Client:         http.DefaultClient,
+		Hydra:          hydraClient,
+		Orion:          orionClient,
+		JWT:            jwtClient,
+		Decoder:        schema.NewDecoder(),
+	}
+}
+
+// CommonRequest contains the common part of the information
+// POSTed as json to the server
+type CommonRequest struct {
+	Accept      bool `json:"accept" schema:"accept"` // Just accept the request if session is open
+	RememberFor int  `json:"remember_for" schema:"remember_for"`
+	// If Retry == true, an authentication failure will not
+	// trigger a reject to Hydra.
+	Retry bool `json:"retry" schema:"retry"`
+}
+
+// LoginRequest contains the information POSTed for /auth requests
 type LoginRequest struct {
 	Credentials
-	Accept      bool `json:"accept"` // Just accept the request if session is open
-	RememberFor int  `json:"remember_for"`
-	// If Retry == true, an authentication failure will not
-	// trigger a reject to Hydra.
-	Retry bool `json:"retry"`
+	CommonRequest
 }
 
-// ConsentRequest contains the information POSTed as json to the server
+// ConsentRequest contains the information POSTed for /consent requests
 type ConsentRequest struct {
-	Accept      bool `json:"accept"` // Just accept the request if session is open
-	RememberFor int  `json:"remember_for"`
-	// If Retry == true, an authentication failure will not
-	// trigger a reject to Hydra.
-	Retry bool `json:"retry"`
+	CommonRequest
 }
 
-// ErrorMessage returned by the API on error
-type ErrorMessage struct {
+// CommonResponse contains the common part of server responses
+type CommonResponse struct {
 	Redirect string `json:"redirect"`
 	Final    bool   `json:"final"` // True if error was fatal and cannot be retried
+}
+
+// ErrorResponse returned by the API on error
+type ErrorResponse struct {
+	CommonResponse
 	JsonError
 }
 
-// SuccessMessage returned by the API on success
-type SuccessMessage struct {
-	// On POST, this is always the redirect URL.
-	// On GET, this is always the login/consent page.
-	Redirect string `json:"redirect"`
-	Final    bool   `json:"final"` // True if auth process completed
+// SuccessResponse returned by the API on success
+type SuccessResponse struct {
+	CommonResponse
 	// On CONSENT, this is always the challenge user info.
 	// On AUTH, this is the logged user info, if there is a session. Otherwise, it is empty.
 	// This can be used to check whether the user is logged in or not.
 	LoginInfo
 	// Client is only returned for GET calls, both auth and consent.
 	Client ClientInfo `json:"client,omitempty"`
+}
+
+// CSRFErrorHandler returns an error when request is wrong. Intended for CSRF.
+func (api *Api) csrfErrorHandler(w http.ResponseWriter, r *http.Request) {
+	defer exhaust(r.Body)
+	marshal := api.encoder(w, r)
+	errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorCSRFFailure, "", csrf.FailureReason(r))
+	api.send(w, r, marshal, errMsg)
 }
 
 // GetLogin handler for GET Login route
@@ -98,7 +130,7 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 	// -----------------------------------------------------------------
 	isAuthFlow, challenge, err := api.getAuthChallenge(w, r, now, marshal)
 	if err != nil {
-		errMsg := newErrorMessage(http.StatusBadRequest, ErrorMissingChallenge, "", err)
+		errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorMissingChallenge, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
@@ -108,18 +140,18 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 	// -------------------------------------------------
 	var challengeData Challenge
 	if isAuthFlow {
-		challengeData, err = api.HydraClient.AuthChallenge(r.Context(), api.Client, challenge)
+		challengeData, err = api.Hydra.AuthChallenge(r.Context(), api.Client, challenge)
 	} else {
-		challengeData, err = api.HydraClient.ConsentChallenge(r.Context(), api.Client, challenge)
+		challengeData, err = api.Hydra.ConsentChallenge(r.Context(), api.Client, challenge)
 	}
 	if err != nil {
-		errMsg := newErrorMessage(http.StatusFailedDependency, ErrorChallengeRequestFail, "", err)
+		errMsg := newErrorMessage(r, http.StatusFailedDependency, ErrorChallengeRequestFail, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
 	if isAuthFlow && challengeData.Skip {
 		// either succeed or fail without showing login screen
-		api.send(w, r, marshal, api.skipAuth(r.Context(), now, challenge, challengeData))
+		api.send(w, r, marshal, api.skipAuth(r, now, challenge, challengeData))
 		return
 	}
 	// If not skipped, GET requests are redirected to either
@@ -134,10 +166,12 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 		// If token is invalid, go ahead but make sure to remove the session
 		removeCookie(w, CookieJwt)
 	}
-	api.send(w, r, marshal, SuccessMessage{
+	api.send(w, r, marshal, SuccessResponse{
+		CommonResponse: CommonResponse{
+			Redirect: redirect,
+		},
 		LoginInfo: info,
 		Client:    challengeData.Client,
-		Redirect:  redirect,
 	})
 }
 
@@ -149,15 +183,15 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 	// Get validation request
 	// ----------------------
 	var loginRequest LoginRequest
-	if err := api.decode(r, &loginRequest); err != nil {
-		errMsg := newErrorMessage(http.StatusBadRequest, ErrorInvalidContent, "", err)
+	if err := api.parseRequest(r, &loginRequest); err != nil {
+		errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorInvalidContent, "", err)
 		api.send(w, r, marshal, errMsg)
 	}
 	// Get the challenge
 	// -----------------
 	isAuthFlow, challenge, err := api.getAuthChallenge(w, r, now, marshal)
 	if err != nil {
-		errMsg := newErrorMessage(http.StatusBadRequest, ErrorMissingChallenge, "", err)
+		errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorMissingChallenge, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
@@ -169,6 +203,7 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 		// with Redirect => LoginPath.
 		removeCookie(w, CookieJwt)
 		api.send(w, r, marshal, newErrorMessage(
+			r,
 			http.StatusUnauthorized,
 			ErrorAcceptSessionExpired,
 			api.LoginPath,
@@ -180,10 +215,10 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 	// ----------------------------
 	info, err = api.Orion.Login(r.Context(), api.Client, loginRequest.Credentials)
 	if err != nil {
-		var errMsg message = newErrorMessage(http.StatusUnauthorized, ErrorAuthFailed, "", err)
+		var errMsg message = newErrorMessage(r, http.StatusUnauthorized, ErrorAuthFailed, "", err)
 		if !loginRequest.Retry {
 			// Retry == false, Reject the login_challenge
-			errMsg = api.rejectAuth(r.Context(), challenge, ChallengeReject{
+			errMsg = api.rejectAuth(r, challenge, ChallengeReject{
 				StatusCode:       http.StatusUnauthorized,
 				ErrorCode:        ErrorAuthFailed,
 				ErrorDescription: "Invalid credentials or too many authentication attempts",
@@ -198,15 +233,17 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 	// --------------------------------------------
 	exp := now.Add(api.CookieLifetime)
 	if err := api.WriteJWT(w, r, now, exp, info); err != nil {
-		errMsg := newErrorMessage(http.StatusFailedDependency, ErrorSigningFailed, "", err)
+		errMsg := newErrorMessage(r, http.StatusFailedDependency, ErrorSigningFailed, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
 	// If not isAuthFlow, go back to consent flow
 	// ------------------------------------------
 	if !isAuthFlow {
-		api.send(w, r, marshal, SuccessMessage{
-			Redirect:  api.ConsentPath,
+		api.send(w, r, marshal, SuccessResponse{
+			CommonResponse: CommonResponse{
+				Redirect: api.ConsentPath,
+			},
 			LoginInfo: info,
 		})
 		return
@@ -217,7 +254,7 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 	if loginRequest.RememberFor > 0 {
 		rem = now.Add(time.Duration(loginRequest.RememberFor) * time.Second)
 	}
-	api.send(w, r, marshal, api.accept(r.Context(), challenge, now, rem, info))
+	api.send(w, r, marshal, api.accept(r, challenge, now, rem, info))
 }
 
 // GetConsent handler for GET Consent flow
@@ -229,26 +266,26 @@ func (api *Api) GetConsent(w http.ResponseWriter, r *http.Request) {
 	// -----------------
 	challenge, err := api.getConsentChallenge(w, r, now, marshal)
 	if err != nil {
-		errMsg := newErrorMessage(http.StatusBadRequest, ErrorMissingChallenge, "", err)
+		errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorMissingChallenge, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
 	// Collect challenge information from hydra.
 	// -----------------------------------------
-	challengeData, err := api.HydraClient.ConsentChallenge(r.Context(), api.Client, challenge)
+	challengeData, err := api.Hydra.ConsentChallenge(r.Context(), api.Client, challenge)
 	if err != nil {
-		errMsg := newErrorMessage(http.StatusFailedDependency, ErrorChallengeRequestFail, "", err)
+		errMsg := newErrorMessage(r, http.StatusFailedDependency, ErrorChallengeRequestFail, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
 	if challengeData.Skip {
 		// either succeed or fail without showing consent screen
-		api.send(w, r, marshal, api.skipConsent(r.Context(), now, challenge, challengeData))
+		api.send(w, r, marshal, api.skipConsent(r, now, challenge, challengeData))
 		return
 	}
 	info, err := api.Orion.Decode(challengeData.Subject, challengeData.RequestedScope)
 	if err != nil {
-		api.send(w, r, marshal, api.rejectAuth(r.Context(), challenge, ChallengeReject{
+		api.send(w, r, marshal, api.rejectAuth(r, challenge, ChallengeReject{
 			StatusCode:       http.StatusUnauthorized,
 			ErrorCode:        "consent_subject_required",
 			ErrorDescription: "Consent Challenge could not be decoded",
@@ -257,14 +294,16 @@ func (api *Api) GetConsent(w http.ResponseWriter, r *http.Request) {
 		}))
 	}
 	// If not Skip, GET requests get redirected to consent
-	api.send(w, r, marshal, SuccessMessage{
+	api.send(w, r, marshal, SuccessResponse{
+		CommonResponse: CommonResponse{
+			Redirect: api.ConsentPath,
+		},
 		LoginInfo: info,
 		Client:    challengeData.Client,
-		Redirect:  api.ConsentPath,
 	})
 }
 
-// GetConsent handler for GET Consent flow
+// PostConsent handler for POST Consent flow
 func (api *Api) PostConsent(w http.ResponseWriter, r *http.Request) {
 	defer exhaust(r.Body)
 	marshal := api.encoder(w, r)
@@ -279,6 +318,7 @@ func (api *Api) PostConsent(w http.ResponseWriter, r *http.Request) {
 	if info.Subject == "" {
 		removeCookie(w, CookieJwt)
 		api.send(w, r, marshal, newErrorMessage(
+			r,
 			http.StatusUnauthorized,
 			ErrorAcceptSessionExpired,
 			api.LoginPath,
@@ -291,21 +331,21 @@ func (api *Api) PostConsent(w http.ResponseWriter, r *http.Request) {
 	// -------------------------------------------------------
 	challenge, err := api.getConsentChallenge(w, r, now, marshal)
 	if err != nil {
-		errMsg := newErrorMessage(http.StatusBadRequest, ErrorMissingChallenge, "", err)
+		errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorMissingChallenge, "", err)
 		api.send(w, r, marshal, errMsg)
 		return
 	}
 	var consentRequest ConsentRequest
-	if err := api.decode(r, &consentRequest); err != nil {
-		errMsg := newErrorMessage(http.StatusBadRequest, ErrorInvalidContent, "", err)
+	if err := api.parseRequest(r, &consentRequest); err != nil {
+		errMsg := newErrorMessage(r, http.StatusBadRequest, ErrorInvalidContent, "", err)
 		api.send(w, r, marshal, errMsg)
 	}
 	// Consent to the requested params
 	if err = api.Orion.Consent(r.Context(), api.Client, info); err != nil {
-		var errMsg message = newErrorMessage(http.StatusUnauthorized, ErrorAuthFailed, "", err)
+		var errMsg message = newErrorMessage(r, http.StatusUnauthorized, ErrorAuthFailed, "", err)
 		if !consentRequest.Retry {
 			// Retry == false, Reject the consent_challenge
-			errMsg = api.rejectConsent(r.Context(), challenge, ChallengeReject{
+			errMsg = api.rejectConsent(r, challenge, ChallengeReject{
 				StatusCode:       http.StatusUnauthorized,
 				ErrorCode:        ErrorAuthFailed,
 				ErrorDescription: "Invalid scopes or too many consent attempts",
@@ -322,7 +362,28 @@ func (api *Api) PostConsent(w http.ResponseWriter, r *http.Request) {
 	if consentRequest.RememberFor > 0 {
 		exp = now.Add(time.Duration(consentRequest.RememberFor) * time.Second)
 	}
-	api.send(w, r, marshal, api.consent(r.Context(), challenge, now, exp, info))
+	api.send(w, r, marshal, api.consent(r, challenge, now, exp, info))
+}
+
+// parseRequest reads a request either as json or form
+func (api *Api) parseRequest(r *http.Request, data interface{}) error {
+	contentType := r.Header.Get(http.CanonicalHeaderKey("Content-Type"))
+	// Try json
+	if strings.HasPrefix(contentType, "application/json") {
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(data); err != nil {
+			return err
+		}
+		return nil
+	}
+	// Fallback to form params
+	if err := r.ParseForm(); err != nil {
+		return err
+	}
+	if err := api.Decoder.Decode(data, r.PostForm); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Logout handler for GET routes
@@ -377,7 +438,7 @@ func (api *Api) getChallenge(w http.ResponseWriter, r *http.Request, now time.Ti
 
 // encoder builds a json encoder, if API requested json response
 func (api *Api) encoder(w http.ResponseWriter, r *http.Request) *json.Encoder {
-	hasAccept, acceptJson := r.Header.Values("Accept"), false
+	hasAccept, acceptJson := r.Header.Values(http.CanonicalHeaderKey("Accept")), false
 	for _, accept := range hasAccept {
 		if strings.HasPrefix(accept, "aplication/json") {
 			acceptJson = true
@@ -413,11 +474,11 @@ func (api *Api) decode(r *http.Request, data interface{}) error {
 }
 
 // SkipAuth tries to skip auth
-func (api *Api) skipAuth(ctx context.Context, now time.Time, challenge string, challengeData Challenge) message {
+func (api *Api) skipAuth(r *http.Request, now time.Time, challenge string, challengeData Challenge) message {
 	// Confirm with Orion that it is ok to Skip
 	info, err := api.Orion.Decode(challengeData.Subject, challengeData.RequestedScope)
 	if err != nil {
-		return api.rejectAuth(ctx, challenge, ChallengeReject{
+		return api.rejectAuth(r, challenge, ChallengeReject{
 			StatusCode:       http.StatusUnauthorized,
 			ErrorCode:        "credentials_required",
 			ErrorDescription: "Challenge could not be decoded",
@@ -425,8 +486,8 @@ func (api *Api) skipAuth(ctx context.Context, now time.Time, challenge string, c
 			ErrorDebug:       err.Error(),
 		})
 	}
-	if err := api.Orion.SkipAuth(ctx, api.Client, info); err != nil {
-		return api.rejectAuth(ctx, challenge, ChallengeReject{
+	if err := api.Orion.SkipAuth(r.Context(), api.Client, info); err != nil {
+		return api.rejectAuth(r, challenge, ChallengeReject{
 			StatusCode:       http.StatusUnauthorized,
 			ErrorCode:        "skip_failed",
 			ErrorDescription: "Authentication skip rejected",
@@ -437,15 +498,15 @@ func (api *Api) skipAuth(ctx context.Context, now time.Time, challenge string, c
 	// Do not refresh JWT or expiration.
 	// TODO: Check if it works, or we need to keep the expiration
 	// date in a cookie.
-	return api.accept(ctx, challenge, now, now, info)
+	return api.accept(r, challenge, now, now, info)
 }
 
 // SkipConsent tries to skip consent
-func (api *Api) skipConsent(ctx context.Context, now time.Time, challenge string, challengeData Challenge) message {
+func (api *Api) skipConsent(r *http.Request, now time.Time, challenge string, challengeData Challenge) message {
 	// Confirm with Orion that it is ok to Skip
 	info, err := api.Orion.Decode(challengeData.Subject, challengeData.RequestedScope)
 	if err != nil {
-		return api.rejectConsent(ctx, challenge, ChallengeReject{
+		return api.rejectConsent(r, challenge, ChallengeReject{
 			StatusCode:       http.StatusUnauthorized,
 			ErrorCode:        "credentials_required",
 			ErrorDescription: "Consent Challenge could not be decoded",
@@ -453,8 +514,8 @@ func (api *Api) skipConsent(ctx context.Context, now time.Time, challenge string
 			ErrorDebug:       err.Error(),
 		})
 	}
-	if err := api.Orion.SkipConsent(ctx, api.Client, info); err != nil {
-		return api.rejectConsent(ctx, challenge, ChallengeReject{
+	if err := api.Orion.SkipConsent(r.Context(), api.Client, info); err != nil {
+		return api.rejectConsent(r, challenge, ChallengeReject{
 			StatusCode:       http.StatusUnauthorized,
 			ErrorCode:        "skip_consent_failed",
 			ErrorDescription: "Consent skip rejected",
@@ -465,7 +526,7 @@ func (api *Api) skipConsent(ctx context.Context, now time.Time, challenge string
 	// Do not refresh JWT or expiration.
 	// TODO: Check if it works, or we need to keep the expiration
 	// date in a cookie.
-	return api.accept(ctx, challenge, now, now, info)
+	return api.accept(r, challenge, now, now, info)
 }
 
 // ReadJWT reads and decodes the subject from jwt token
@@ -531,14 +592,14 @@ func (api *Api) WriteJWT(w http.ResponseWriter, r *http.Request, now, exp time.T
 
 // Message represents a message with an optional Redirect field
 type message interface {
-	// RedirectOrDefault returns redirect URL if no empty, otherwise default value
-	redirectOrDefault(defaultPath string) string
 	statusCode() int
 	isFinal() bool // True if we can clean cookies after this
+	// RedirectOrDefault returns redirect URL if no empty, otherwise default value
+	redirectOrDefault(defaultPath string) (url string, query url.Values)
 }
 
 // accept updates the Hydra server and writes the response
-func (api *Api) accept(ctx context.Context, loginChallenge string, now, exp time.Time, info LoginInfo) message {
+func (api *Api) accept(r *http.Request, loginChallenge string, now, exp time.Time, info LoginInfo) message {
 	accept := LoginAccept{
 		Subject: info.Subject,
 		Context: map[string]string{
@@ -550,19 +611,21 @@ func (api *Api) accept(ctx context.Context, loginChallenge string, now, exp time
 		accept.RememberFor = int(remaining / time.Second)
 		accept.Remember = true
 	}
-	redirect, err := api.HydraClient.AuthAccept(ctx, api.Client, loginChallenge, accept)
+	redirect, err := api.Hydra.AuthAccept(r.Context(), api.Client, loginChallenge, accept)
 	if err != nil {
-		return newErrorMessage(http.StatusInternalServerError, ErrorAcceptRequestFail, "", err)
+		return newErrorMessage(r, http.StatusInternalServerError, ErrorAcceptRequestFail, "", err)
 	}
-	return SuccessMessage{
+	return SuccessResponse{
+		CommonResponse: CommonResponse{
+			Redirect: redirect,
+			Final:    true,
+		},
 		LoginInfo: info,
-		Final:     true,
-		Redirect:  redirect,
 	}
 }
 
 // consent updates the Hydra server and writes the response
-func (api *Api) consent(ctx context.Context, consentChallenge string, now, exp time.Time, info LoginInfo) message {
+func (api *Api) consent(r *http.Request, consentChallenge string, now, exp time.Time, info LoginInfo) message {
 	accept := ConsentAccept{
 		Scopes: info.Scopes,
 	}
@@ -570,113 +633,140 @@ func (api *Api) consent(ctx context.Context, consentChallenge string, now, exp t
 		accept.RememberFor = int(remaining / time.Second)
 		accept.Remember = true
 	}
-	redirect, err := api.HydraClient.ConsentAccept(ctx, api.Client, consentChallenge, accept)
+	redirect, err := api.Hydra.ConsentAccept(r.Context(), api.Client, consentChallenge, accept)
 	if err != nil {
-		return newErrorMessage(http.StatusInternalServerError, ErrorAcceptConsentFail, "", err)
+		return newErrorMessage(r, http.StatusInternalServerError, ErrorAcceptConsentFail, "", err)
 	}
-	return SuccessMessage{
+	return SuccessResponse{
+		CommonResponse: CommonResponse{
+			Redirect: redirect,
+			Final:    true,
+		},
 		LoginInfo: info,
-		Final:     true,
-		Redirect:  redirect,
 	}
 }
 
 // rejectAuth updates the Hydra server and writes the response
-func (api *Api) rejectAuth(ctx context.Context, loginChallenge string, loginReject ChallengeReject) message {
-	redirect, err := api.HydraClient.AuthReject(ctx, api.Client, loginChallenge, loginReject)
+func (api *Api) rejectAuth(r *http.Request, loginChallenge string, loginReject ChallengeReject) message {
+	redirect, err := api.Hydra.AuthReject(r.Context(), api.Client, loginChallenge, loginReject)
 	if err != nil {
-		return newErrorMessage(http.StatusFailedDependency, ErrorRejectRequestFail, "", err)
+		return newErrorMessage(r, http.StatusFailedDependency, ErrorRejectRequestFail, "", err)
 	}
-	return ErrorMessage{
+	return ErrorResponse{
+		CommonResponse: CommonResponse{
+			Redirect: redirect,
+			Final:    true,
+		},
 		JsonError: loginReject.Json(http.StatusUnauthorized),
-		Final:     true,
-		Redirect:  redirect,
 	}
 }
 
 // rejectConsent updates the Hydra server and writes the response
-func (api *Api) rejectConsent(ctx context.Context, consentChallenge string, challengeReject ChallengeReject) message {
-	redirect, err := api.HydraClient.ConsentReject(ctx, api.Client, consentChallenge, challengeReject)
+func (api *Api) rejectConsent(r *http.Request, consentChallenge string, challengeReject ChallengeReject) message {
+	redirect, err := api.Hydra.ConsentReject(r.Context(), api.Client, consentChallenge, challengeReject)
 	if err != nil {
-		return newErrorMessage(http.StatusFailedDependency, ErrorRejectConsentFail, "", err)
+		return newErrorMessage(r, http.StatusFailedDependency, ErrorRejectConsentFail, "", err)
 	}
-	return ErrorMessage{
+	return ErrorResponse{
+		CommonResponse: CommonResponse{
+			Redirect: redirect,
+			Final:    true,
+		},
 		JsonError: challengeReject.Json(http.StatusUnauthorized),
-		Final:     true,
-		Redirect:  redirect,
 	}
 }
 
 // newErrorMessage builds an ErrorMessage from the error
-func newErrorMessage(statusCode int, defaultErrCode, redirect string, err error) ErrorMessage {
+func newErrorMessage(r *http.Request, statusCode int, defaultErrCode, redirect string, err error) ErrorResponse {
 	var jsonError JsonError
 	if ok := errors.As(err, &jsonError); !ok {
 		jsonError.StatusCode = statusCode
 		jsonError.ErrorCode = defaultErrCode
 		jsonError.ErrorDescription = err.Error()
 	}
-	return ErrorMessage{
+	return ErrorResponse{
+		CommonResponse: CommonResponse{
+			Redirect: redirect,
+		},
 		JsonError: jsonError,
-		Redirect:  redirect,
 	}
 }
 
 // Send the message either as json or as a redirect.
-func (api *Api) send(w http.ResponseWriter, r *http.Request, encoder *json.Encoder, e message) {
+func (api *Api) send(w http.ResponseWriter, r *http.Request, encoder *json.Encoder, msg message) {
 	// Make sure to clean dangling cookies
-	if e.isFinal() {
+	if msg.isFinal() {
 		removeCookie(w, CookieLoginChallenge)
 		removeCookie(w, CookieConsentChallenge)
 	}
 	// If using JSON API, return json object
 	if encoder != nil {
 		w.Header().Add("Content-Type", "application/json")
-		w.WriteHeader(e.statusCode())
-		encoder.Encode(e)
+		w.WriteHeader(msg.statusCode())
+		encoder.Encode(msg)
 		return
 	}
+	// If the redirect URL matches a template name, render it
+	redirect, values := msg.redirectOrDefault(api.ErrorPath)
+	if api.Templates != nil {
+		if tmpl := api.Templates.Lookup(redirect); tmpl != nil {
+			w.Header().Add("Content-Type", "text/html")
+			w.WriteHeader(msg.statusCode())
+			err := tmpl.Execute(w, map[string]interface{}{
+				"Message":        msg,
+				csrf.TemplateTag: csrf.TemplateField(r),
+			})
+			if err != nil {
+				log.Println("Failed to render template", err)
+			}
+			return
+		}
+	}
 	// Otherwise, redirect to error page using SeeOther, to turn POST into GET.
-	http.Redirect(w, r, e.redirectOrDefault(api.ErrorPath), http.StatusSeeOther)
+	if values != nil && len(values) > 0 {
+		// Naive concatenation, good enough for now.
+		// Only errors return values != nil.
+		redirect = redirect + "?" + values.Encode()
+	}
+	http.Redirect(w, r, redirect, http.StatusSeeOther)
 }
 
 // redirectOrDefault implements message
-func (s SuccessMessage) redirectOrDefault(defaultPath string) string {
+func (s SuccessResponse) redirectOrDefault(defaultPath string) (string, url.Values) {
 	// Success MUST have a redirect
-	return s.Redirect
+	return s.Redirect, nil
 }
 
 // statusCode implements message
-func (s SuccessMessage) statusCode() int {
+func (s SuccessResponse) statusCode() int {
 	// Success MUST return statusOK
 	return http.StatusOK
 }
 
 // isFinal implements message
-func (s SuccessMessage) isFinal() bool {
-	return s.Final
+func (c CommonResponse) isFinal() bool {
+	return c.Final
 }
 
 // redirectORDefault implements message
-func (e ErrorMessage) redirectOrDefault(errorPath string) string {
+func (e ErrorResponse) redirectOrDefault(errorPath string) (string, url.Values) {
 	if e.Redirect != "" {
-		return e.Redirect
+		return e.Redirect, nil
 	}
-	return errorPath + "?errorCode=" + url.QueryEscape(e.ErrorCode) + "&error=" + url.QueryEscape(e.ErrorDescription)
+	return errorPath, url.Values{
+		"errorCode": []string{e.ErrorCode},
+		"error":     []string{e.ErrorDescription},
+	}
 }
 
 // statusCode implements message
-func (e ErrorMessage) statusCode() int {
+func (e ErrorResponse) statusCode() int {
 	return e.StatusCode
 }
 
 // isFinal implements message
-func (e ErrorMessage) isFinal() bool {
+func (e ErrorResponse) isFinal() bool {
 	return e.Final
-}
-
-type cookieRemoverWriter struct {
-	cookieName string
-	http.ResponseWriter
 }
 
 func removeCookie(w http.ResponseWriter, cookieName string) {
@@ -689,17 +779,4 @@ func removeCookie(w http.ResponseWriter, cookieName string) {
 		MaxAge:   -1,
 		Value:    "",
 	})
-}
-
-func (c cookieRemoverWriter) WriteHeader(code int) {
-	defer c.ResponseWriter.WriteHeader(code)
-	for _, cookie := range c.Header().Values("Cookie") {
-		// TODO: What's the best way to check if the cookie exists?
-		if strings.HasPrefix(cookie, c.cookieName) {
-			// Cookie is already updated, let it be
-			return
-		}
-	}
-	// Remove the cookie before returning
-	removeCookie(c.ResponseWriter, c.cookieName)
 }
