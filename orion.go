@@ -42,7 +42,7 @@ func (o *OrionClient) Decode(subject string, scopes []string) (zero LoginInfo, e
 	return loginInfo, nil
 }
 
-// SkipAuth auth, try to validate decoded info
+// SkipAuth tries to validate decoded info
 func (o *OrionClient) SkipAuth(ctx context.Context, client *http.Client, info LoginInfo) error {
 	// TODO: Validate session?
 	return nil

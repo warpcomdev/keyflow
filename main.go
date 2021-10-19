@@ -27,14 +27,19 @@ func main() {
 			},
 		})
 
-	csrfKey := []byte{}
+	csrfKey := []byte("12345678901234567890123456789012")
 	router := mux.NewRouter()
 	apiRoute := router.Path("/api").Subrouter()
-	apiRoute.Use(csrf.Protect(
+	csrfprot := csrf.Protect(
 		csrfKey,
 		csrf.SameSite(csrf.SameSiteStrictMode),
-		csrf.ErrorHandler(http.HandlerFunc(api.csrfErrorHandler)),
-	))
+		csrf.ErrorHandler(http.HandlerFunc(api.csrfErrorHandler)))
+	apiRoute.Use(func(handler http.Handler) http.Handler {
+		return csrfprot(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("X-CSRF-Token", string(csrf.Token(r)))
+			handler.ServeHTTP(w, r)
+		}))
+	})
 
 	apiRoute.HandleFunc("/auth", api.PostLogin).Methods("POST")
 	apiRoute.HandleFunc("/auth", api.GetLogin).Methods("GET")

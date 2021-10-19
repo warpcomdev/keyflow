@@ -126,7 +126,7 @@ func (api *Api) GetLogin(w http.ResponseWriter, r *http.Request) {
 	marshal := api.encoder(w, r)
 	now := time.Now()
 	// Get the challenge. This function can be called either during the
-	// auth flow, or the consent flow (it session expired)
+	// auth flow, or the consent flow (if session expired)
 	// -----------------------------------------------------------------
 	isAuthFlow, challenge, err := api.getAuthChallenge(w, r, now, marshal)
 	if err != nil {
@@ -198,44 +198,47 @@ func (api *Api) PostLogin(w http.ResponseWriter, r *http.Request) {
 	// If we are accepting, check for expired session
 	// ----------------------------------------------
 	info, _, err := api.ReadJWT(r, now)
-	if loginRequest.Accept && info.Subject == "" {
-		// Tried to accept but session expired, reject
-		// with Redirect => LoginPath.
-		removeCookie(w, CookieJwt)
-		api.send(w, r, marshal, newErrorMessage(
-			r,
-			http.StatusUnauthorized,
-			ErrorAcceptSessionExpired,
-			api.LoginPath,
-			errors.New("Session expired, please login again"),
-		))
-		return
-	}
-	// Otherwise, check credentials
-	// ----------------------------
-	info, err = api.Orion.Login(r.Context(), api.Client, loginRequest.Credentials)
-	if err != nil {
-		var errMsg message = newErrorMessage(r, http.StatusUnauthorized, ErrorAuthFailed, "", err)
-		if !loginRequest.Retry {
-			// Retry == false, Reject the login_challenge
-			errMsg = api.rejectAuth(r, challenge, ChallengeReject{
-				StatusCode:       http.StatusUnauthorized,
-				ErrorCode:        ErrorAuthFailed,
-				ErrorDescription: "Invalid credentials or too many authentication attempts",
-				ErrorHint:        "Authentication failed",
-				ErrorDebug:       err.Error(),
-			})
+	if loginRequest.Accept {
+		if info.Subject == "" {
+			// Tried to accept but session expired, reject
+			// with Redirect => LoginPath.
+			removeCookie(w, CookieJwt)
+			api.send(w, r, marshal, newErrorMessage(
+				r,
+				http.StatusUnauthorized,
+				ErrorAcceptSessionExpired,
+				api.LoginPath,
+				errors.New("Session expired, please login again"),
+			))
+			return
 		}
-		api.send(w, r, marshal, errMsg)
-		return
-	}
-	// Authentication succeeded. Set session cookie
-	// --------------------------------------------
-	exp := now.Add(api.CookieLifetime)
-	if err := api.WriteJWT(w, r, now, exp, info); err != nil {
-		errMsg := newErrorMessage(r, http.StatusFailedDependency, ErrorSigningFailed, "", err)
-		api.send(w, r, marshal, errMsg)
-		return
+	} else {
+		// Otherwise, check credentials
+		// ----------------------------
+		info, err = api.Orion.Login(r.Context(), api.Client, loginRequest.Credentials)
+		if err != nil {
+			var errMsg message = newErrorMessage(r, http.StatusUnauthorized, ErrorAuthFailed, "", err)
+			if !loginRequest.Retry {
+				// Retry == false, Reject the login_challenge
+				errMsg = api.rejectAuth(r, challenge, ChallengeReject{
+					StatusCode:       http.StatusUnauthorized,
+					ErrorCode:        ErrorAuthFailed,
+					ErrorDescription: "Invalid credentials or too many authentication attempts",
+					ErrorHint:        "Authentication failed",
+					ErrorDebug:       err.Error(),
+				})
+			}
+			api.send(w, r, marshal, errMsg)
+			return
+		}
+		// Authentication succeeded. Set session cookie
+		// --------------------------------------------
+		exp := now.Add(api.CookieLifetime)
+		if err := api.WriteJWT(w, r, now, exp, info); err != nil {
+			errMsg := newErrorMessage(r, http.StatusFailedDependency, ErrorSigningFailed, "", err)
+			api.send(w, r, marshal, errMsg)
+			return
+		}
 	}
 	// If not isAuthFlow, go back to consent flow
 	// ------------------------------------------
@@ -406,7 +409,7 @@ func (api *Api) getAuthChallenge(w http.ResponseWriter, r *http.Request, now tim
 	return true, "", err
 }
 
-// getAuthChallenge gets the auth challenge from URL or cookie
+// getConsentChallenge gets the auth challenge from URL or cookie
 func (api *Api) getConsentChallenge(w http.ResponseWriter, r *http.Request, now time.Time, marshal *json.Encoder) (challenge string, err error) {
 	return api.getChallenge(w, r, now, marshal, CookieConsentChallenge, CONSENT_CHALLENGE)
 }

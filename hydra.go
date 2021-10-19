@@ -177,7 +177,7 @@ func (hc *HydraClient) AuthChallenge(ctx context.Context, client *http.Client, c
 	return
 }
 
-// Reject a login Challenge, return redirect URL
+// ConsentReject a consent Challenge, return redirect URL
 func (hc *HydraClient) ConsentReject(ctx context.Context, client *http.Client, challenge string, reject ChallengeReject) (string, error) {
 	var feedback feedbackResponse
 	if err := hc.request(ctx, client, "/oauth2/auth/requests/consent/reject", http.MethodPut, CONSENT_CHALLENGE, challenge, reject, &feedback); err != nil {
@@ -186,7 +186,7 @@ func (hc *HydraClient) ConsentReject(ctx context.Context, client *http.Client, c
 	return feedback.RedirectTo, nil
 }
 
-// Accept a login Challenge, return redirect URL
+// ConsentAccept a consent Challenge, return redirect URL
 func (hc *HydraClient) ConsentAccept(ctx context.Context, client *http.Client, challenge string, accept ConsentAccept) (string, error) {
 	var feedback feedbackResponse
 	if err := hc.request(ctx, client, "/oauth2/auth/requests/consent/accept", http.MethodPut, CONSENT_CHALLENGE, challenge, accept, &feedback); err != nil {
